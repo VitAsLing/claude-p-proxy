@@ -50,6 +50,7 @@ bun run dev          # Start with file watching (auto-restart)
 | `CLAUDE_PATH` | `claude` | Path to Claude CLI binary |
 | `DEFAULT_MODEL` | `claude-sonnet-4-6` | Default model |
 | `CLAUDE_TIMEOUT` | `120000` | Subprocess timeout (ms) |
+| `MAX_CONCURRENT` | `3` | Max concurrent subprocess count |
 | `VERBOSE` | `false` | Verbose logging |
 
 ## Code Style

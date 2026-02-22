@@ -2,7 +2,7 @@ import config from "./config";
 import type { ChatCompletionRequest } from "./types/openai";
 import { requestToCliArgs, resolveModel } from "./adapter/openai-to-cli";
 import { buildChatResponse, buildStreamChunk, encodeSSE } from "./adapter/cli-to-openai";
-import { runClaude, runClaudeStream } from "./subprocess/manager";
+import { runClaude, runClaudeStream, ConcurrencyLimitError, getActiveCount } from "./subprocess/manager";
 import { SessionManager } from "./session/manager";
 
 // ── 初始化 ─────────────────────────────────────────────────────
@@ -56,49 +56,76 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     const cliArgs = requestToCliArgs(body, { stream: true, sessionId, resume });
     const requestId = crypto.randomUUID().replace(/-/g, "").slice(0, 24);
     let isFirst = true;
-    let streamHandle: ReturnType<typeof runClaudeStream> | null = null;
 
-    const readable = new ReadableStream({
-      start(controller) {
-        streamHandle = runClaudeStream(
-          cliArgs,
-          (text) => {
-            controller.enqueue(encodeSSE(buildStreamChunk(text, requestModel, requestId, { isFirst })));
-            isFirst = false;
-          },
-          (_sid) => {
-            // 可选：捕获 CLI 返回的 session_id 用于后续更新映射
+    // 在构造 ReadableStream 之前启动子进程（acquireSlot 可能抛出 ConcurrencyLimitError）
+    let streamHandle: ReturnType<typeof runClaudeStream>;
+    try {
+      // 用临时数组缓冲 start() 之前到达的 chunks（几乎不会发生，但安全起见）
+      let controller: ReadableStreamDefaultController | null = null;
+      const pendingChunks: Uint8Array[] = [];
+
+      streamHandle = runClaudeStream(
+        cliArgs,
+        (text) => {
+          const encoded = encodeSSE(buildStreamChunk(text, requestModel, requestId, { isFirst }));
+          isFirst = false;
+          if (controller) {
+            controller.enqueue(encoded);
+          } else {
+            pendingChunks.push(encoded);
           }
+        },
+        (_sid) => {
+          // 可选：捕获 CLI 返回的 session_id 用于后续更新映射
+        }
+      );
+
+      const readable = new ReadableStream({
+        start(ctrl) {
+          controller = ctrl;
+          // flush any buffered chunks
+          for (const chunk of pendingChunks) {
+            ctrl.enqueue(chunk);
+          }
+          pendingChunks.length = 0;
+
+          streamHandle.done
+            .then(() => {
+              try {
+                ctrl.enqueue(encodeSSE(buildStreamChunk("", requestModel, requestId, { done: true })));
+                ctrl.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+                ctrl.close();
+              } catch { /* stream already closed (client disconnected) */ }
+            })
+            .catch((err: any) => {
+              try {
+                ctrl.enqueue(encodeSSE({ error: { message: err.message } }));
+                ctrl.close();
+              } catch { /* stream already closed */ }
+            });
+        },
+        cancel() {
+          // 客户端断开连接时终止子进程
+          streamHandle.kill();
+        },
+      });
+
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        },
+      });
+    } catch (err: any) {
+      if (err instanceof ConcurrencyLimitError) {
+        return Response.json(
+          { error: { message: err.message, type: "rate_limit_error" } },
+          { status: 429, headers: { "Retry-After": "5" } }
         );
-
-        streamHandle.done
-          .then(() => {
-            try {
-              controller.enqueue(encodeSSE(buildStreamChunk("", requestModel, requestId, { done: true })));
-              controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
-              controller.close();
-            } catch { /* stream already closed (client disconnected) */ }
-          })
-          .catch((err: any) => {
-            try {
-              controller.enqueue(encodeSSE({ error: { message: err.message } }));
-              controller.close();
-            } catch { /* stream already closed */ }
-          });
-      },
-      cancel() {
-        // 客户端断开连接时终止子进程
-        streamHandle?.kill();
-      },
-    });
-
-    return new Response(readable, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    });
+      }
+      throw err;
+    }
   }
 
   // ── 非流式响应 ──
@@ -107,6 +134,12 @@ async function handleChatCompletions(req: Request): Promise<Response> {
     const result = await runClaude(cliArgs);
     return Response.json(buildChatResponse(result.text, requestModel));
   } catch (err: any) {
+    if (err instanceof ConcurrencyLimitError) {
+      return Response.json(
+        { error: { message: err.message, type: "rate_limit_error" } },
+        { status: 429, headers: { "Retry-After": "5" } }
+      );
+    }
     console.error(`[server] error: ${err.message}`);
     return Response.json(
       { error: { message: err.message } },
@@ -131,9 +164,11 @@ function handleHealth(): Response {
     version: "1.0.0",
     models: Object.keys(config.models),
     sessions: sessions.size,
+    activeProcesses: getActiveCount(),
     config: {
       defaultModel: config.defaultModel,
       timeout: `${config.timeout / 1000}s`,
+      maxConcurrent: config.maxConcurrent,
     },
   });
 }
@@ -211,6 +246,7 @@ console.log(`
 │  🌐 http://${config.host}:${config.port}                         │
 │  🤖 Model:   ${config.defaultModel.padEnd(34)}│
 │  ⏱️  Timeout: ${(config.timeout / 1000 + "s").padEnd(34)}│
+│  🔀 Concur:  ${(config.maxConcurrent + " max").padEnd(34)}│
 └──────────────────────────────────────────────────┘
 
 Endpoints:
@@ -225,3 +261,38 @@ OpenClaw 配置:
   openclaw config set env.OPENAI_BASE_URL "http://${config.host}:${config.port}/v1"
   openclaw config set agents.defaults.model "openai/claude-sonnet-4"
 `);
+
+// ── Graceful Shutdown ───────────────────────────────────────────
+
+let shuttingDown = false;
+
+async function gracefulShutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`\n[shutdown] Received ${signal}, shutting down gracefully...`);
+
+  // 停止接受新连接
+  server.stop();
+  console.log("[shutdown] Stopped accepting new connections");
+
+  // 等待活跃进程完成（最多等 30 秒）
+  const maxWait = 30_000;
+  const start = performance.now();
+  while (getActiveCount() > 0 && performance.now() - start < maxWait) {
+    console.log(`[shutdown] Waiting for ${getActiveCount()} active process(es)...`);
+    await Bun.sleep(1000);
+  }
+
+  if (getActiveCount() > 0) {
+    console.log(`[shutdown] Timed out with ${getActiveCount()} active process(es), forcing exit`);
+  } else {
+    console.log("[shutdown] All processes completed");
+  }
+
+  console.log("[shutdown] Bye!");
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));

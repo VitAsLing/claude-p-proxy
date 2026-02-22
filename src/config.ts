@@ -5,6 +5,7 @@ export interface Config {
   defaultModel: string;
   timeout: number;
   verbose: boolean;
+  maxConcurrent: number;
   models: Record<string, string>;
 }
 
@@ -15,6 +16,7 @@ const config: Config = {
   defaultModel: Bun.env.DEFAULT_MODEL || "claude-sonnet-4-6",
   timeout: parseInt(Bun.env.CLAUDE_TIMEOUT || "120000"),
   verbose: Bun.argv.includes("--verbose") || Bun.env.VERBOSE === "true",
+  maxConcurrent: parseInt(Bun.env.MAX_CONCURRENT || "3"),
 
   // 模型映射：请求中的简写 → CLI 实际模型 ID
   models: {

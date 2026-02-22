@@ -1,6 +1,31 @@
 import type { CliArgs, CliJsonResponse } from "../types/claude-cli";
 import config from "../config";
 
+// ── 并发控制 ─────────────────────────────────────────────────────
+export class ConcurrencyLimitError extends Error {
+  constructor(active: number, max: number) {
+    super(`Concurrency limit reached: ${active}/${max} active subprocesses`);
+    this.name = "ConcurrencyLimitError";
+  }
+}
+
+let activeCount = 0;
+
+export function getActiveCount(): number {
+  return activeCount;
+}
+
+function acquireSlot(): void {
+  if (activeCount >= config.maxConcurrent) {
+    throw new ConcurrencyLimitError(activeCount, config.maxConcurrent);
+  }
+  activeCount++;
+}
+
+function releaseSlot(): void {
+  activeCount = Math.max(0, activeCount - 1);
+}
+
 /**
  * 构建 CLI 启动参数
  */
@@ -50,58 +75,64 @@ export async function runClaude(cliArgs: CliArgs): Promise<{
   text: string;
   sessionId?: string;
 }> {
-  const args = buildArgs(cliArgs);
+  acquireSlot();
 
-  if (config.verbose) {
-    console.log(`[subprocess] spawn: claude ${args.filter(a => a !== cliArgs.prompt).join(" ")}`);
-  }
+  try {
+    const args = buildArgs(cliArgs);
 
-  const startTime = performance.now();
-
-  const proc = Bun.spawn([config.claudePath, ...args], {
-    env: buildEnv(),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  const timer = setTimeout(() => {
-    proc.kill();
-  }, config.timeout);
-
-  const stdout = await new Response(proc.stdout).text();
-  const stderr = await new Response(proc.stderr).text();
-  const exitCode = await proc.exited;
-
-  clearTimeout(timer);
-
-  const elapsed = (performance.now() - startTime).toFixed(0);
-
-  if (config.verbose) {
-    console.log(`[subprocess] done in ${elapsed}ms (exit: ${exitCode})`);
-    if (stderr.trim()) console.log(`[subprocess] stderr: ${stderr.trim()}`);
-  }
-
-  if (exitCode !== 0) {
-    throw new Error(
-      `claude -p exited with code ${exitCode}: ${stderr.trim() || "unknown error"}`
-    );
-  }
-
-  // --output-format json 时解析 JSON 获取 session_id
-  if (cliArgs.outputFormat === "json") {
-    try {
-      const json: CliJsonResponse = JSON.parse(stdout);
-      return {
-        text: json.result || stdout.trim(),
-        sessionId: json.session_id,
-      };
-    } catch {
-      // JSON 解析失败，回退到纯文本
-      return { text: stdout.trim() };
+    if (config.verbose) {
+      console.log(`[subprocess] spawn: claude ${args.filter(a => a !== cliArgs.prompt).join(" ")} (active: ${activeCount}/${config.maxConcurrent})`);
     }
-  }
 
-  return { text: stdout.trim() };
+    const startTime = performance.now();
+
+    const proc = Bun.spawn([config.claudePath, ...args], {
+      env: buildEnv(),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const timer = setTimeout(() => {
+      proc.kill();
+    }, config.timeout);
+
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+
+    clearTimeout(timer);
+
+    const elapsed = (performance.now() - startTime).toFixed(0);
+
+    if (config.verbose) {
+      console.log(`[subprocess] done in ${elapsed}ms (exit: ${exitCode})`);
+      if (stderr.trim()) console.log(`[subprocess] stderr: ${stderr.trim()}`);
+    }
+
+    if (exitCode !== 0) {
+      throw new Error(
+        `claude -p exited with code ${exitCode}: ${stderr.trim() || "unknown error"}`
+      );
+    }
+
+    // --output-format json 时解析 JSON 获取 session_id
+    if (cliArgs.outputFormat === "json") {
+      try {
+        const json: CliJsonResponse = JSON.parse(stdout);
+        return {
+          text: json.result || stdout.trim(),
+          sessionId: json.session_id,
+        };
+      } catch {
+        // JSON 解析失败，回退到纯文本
+        return { text: stdout.trim() };
+      }
+    }
+
+    return { text: stdout.trim() };
+  } finally {
+    releaseSlot();
+  }
 }
 
 /**
@@ -153,10 +184,12 @@ export function runClaudeStream(
   onChunk: (text: string) => void,
   onSessionId?: (sessionId: string) => void
 ): StreamHandle {
+  acquireSlot();
+
   const args = buildArgs(cliArgs);
 
   if (config.verbose) {
-    console.log(`[subprocess] spawn stream: claude ${args.filter(a => a !== cliArgs.prompt).join(" ")}`);
+    console.log(`[subprocess] spawn stream: claude ${args.filter(a => a !== cliArgs.prompt).join(" ")} (active: ${activeCount}/${config.maxConcurrent})`);
   }
 
   const proc = Bun.spawn([config.claudePath, ...args], {
@@ -175,48 +208,52 @@ export function runClaudeStream(
   }, config.timeout);
 
   const done = (async () => {
-    const reader = proc.stdout.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
+    try {
+      const reader = proc.stdout.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-    while (true) {
-      const { done: eof, value } = await reader.read();
-      if (eof) break;
+      while (true) {
+        const { done: eof, value } = await reader.read();
+        if (eof) break;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
 
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const raw = JSON.parse(line);
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const raw = JSON.parse(line);
 
-          // 捕获 session_id
-          const sid = extractSessionId(raw);
-          if (sid && onSessionId) {
-            onSessionId(sid);
+            // 捕获 session_id
+            const sid = extractSessionId(raw);
+            if (sid && onSessionId) {
+              onSessionId(sid);
+            }
+
+            // 提取文本 delta
+            const text = extractTextDelta(raw);
+            if (text) {
+              onChunk(text);
+            }
+          } catch {
+            // 跳过非 JSON 行
           }
-
-          // 提取文本 delta
-          const text = extractTextDelta(raw);
-          if (text) {
-            onChunk(text);
-          }
-        } catch {
-          // 跳过非 JSON 行
         }
       }
-    }
 
-    clearTimeout(timer);
+      clearTimeout(timer);
 
-    const exitCode = await proc.exited;
-    if (exitCode !== 0 && !killed) {
-      const stderr = await new Response(proc.stderr).text();
-      throw new Error(
-        `claude -p stream exited with code ${exitCode}: ${stderr.trim()}`
-      );
+      const exitCode = await proc.exited;
+      if (exitCode !== 0 && !killed) {
+        const stderr = await new Response(proc.stderr).text();
+        throw new Error(
+          `claude -p stream exited with code ${exitCode}: ${stderr.trim()}`
+        );
+      }
+    } finally {
+      releaseSlot();
     }
   })();
 
