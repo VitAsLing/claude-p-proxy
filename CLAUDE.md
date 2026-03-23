@@ -4,7 +4,7 @@
 
 claude-p-proxy — OpenAI-compatible API proxy that wraps `claude -p` (Claude Code CLI). Allows Claude Max subscriptions to be used by OpenClaw and other OpenAI-compatible clients.
 
-**Stack:** Bun + TypeScript, zero production dependencies.
+**Stack:** Bun + TypeScript, zero production dependencies — use Bun built-in APIs only.
 
 ## Architecture
 
@@ -21,14 +21,6 @@ Key modules:
 - `src/session/manager.ts` — Maps external session IDs to CLI session IDs (in-memory)
 - `src/types/openai.ts` — OpenAI API type definitions
 - `src/types/claude-cli.ts` — Claude CLI JSON/stream-json output types
-
-## Commands
-
-```bash
-bun install          # Install dependencies
-bun run start        # Start server (default port 3456)
-bun run dev          # Start with file watching (auto-restart)
-```
 
 ## Key Design Decisions
 
@@ -52,11 +44,3 @@ bun run dev          # Start with file watching (auto-restart)
 | `CLAUDE_TIMEOUT` | `120000` | Subprocess timeout (ms) |
 | `MAX_CONCURRENT` | `3` | Max concurrent subprocess count |
 | `VERBOSE` | `false` | Verbose logging |
-
-## Code Style
-
-- TypeScript strict mode, ESNext target, Bun types
-- ES modules (`"type": "module"` in package.json)
-- No semicolons preference is not enforced — existing code uses semicolons
-- Chinese comments are acceptable (project originated in Chinese)
-- Keep zero production dependencies — use Bun built-in APIs (Bun.serve, Bun.spawn, crypto.randomUUID, ReadableStream, etc.)
